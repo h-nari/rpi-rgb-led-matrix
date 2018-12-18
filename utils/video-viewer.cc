@@ -26,6 +26,7 @@ extern "C" {
 
 #include "led-matrix.h"
 #include "content-streamer.h"
+#include "timeval.h"
 
 using rgb_matrix::FrameCanvas;
 using rgb_matrix::RGBMatrix;
@@ -46,14 +47,34 @@ static void InterruptHandler(int) {
 struct LedPixel {
   uint8_t r, g, b;
 };
+
+#define GAMMA_CORRECTION  1
+
 void CopyFrame(AVFrame *pFrame, FrameCanvas *canvas) {
+#if GAMMA_CORRECTION
+  static bool gamma_table_initialized;
+  static uint8_t gamma[256];
+
+  if(!gamma_table_initialized){
+    for(int i=0; i<256; i++){
+      double  v = i / 255.0;
+      gamma[i] =  int(v * v * v * 255.0 + 0.5);
+    }
+    gamma_table_initialized = true;
+  }
+#endif
+
   // Write pixel data
   const int height = canvas->height();
   const int width = canvas->width();
   for(int y = 0; y < height; ++y) {
     LedPixel *pix = (LedPixel*) (pFrame->data[0] + y*pFrame->linesize[0]);
     for(int x = 0; x < width; ++x, ++pix) {
+#if GAMMA_CORRECTION
+      canvas->SetPixel(x, y, gamma[pix->r], gamma[pix->g], gamma[pix->b]);
+#else
       canvas->SetPixel(x, y, pix->r, pix->g, pix->b);
+#endif
     }
   }
 }
@@ -244,7 +265,9 @@ int main(int argc, char *argv[]) {
   signal(SIGINT, InterruptHandler);
 
   const int frame_wait_micros = 1e6 / fps;
+
   do {
+    TimeVal next_frame_time = TimeVal::now() + frame_wait_micros;
     if (forever) {
       av_seek_frame(pFormatCtx, videoStream, 0, AVSEEK_FLAG_ANY);
       avcodec_flush_buffers(pCodecCtx);
@@ -257,20 +280,37 @@ int main(int argc, char *argv[]) {
 
         // Did we get a video frame?
         if (frameFinished) {
-          // Convert the image from its native format to RGB
-          sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
-                    pFrame->linesize, 0, pCodecCtx->height,
-                    pFrameRGB->data, pFrameRGB->linesize);
+          TimeVal now = TimeVal::now();
 
-          CopyFrame(pFrameRGB, offscreen_canvas);
-          frame_count++;
-          if (stream_writer) {
-            stream_writer->Stream(*offscreen_canvas, frame_wait_micros);
+          if(now < next_frame_time || stream_writer){
+
+            // Convert the image from its native format to RGB
+            sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
+                      pFrame->linesize, 0, pCodecCtx->height,
+                      pFrameRGB->data, pFrameRGB->linesize);
+
+            CopyFrame(pFrameRGB, offscreen_canvas);
+
+            if (stream_writer) {
+              stream_writer->Stream(*offscreen_canvas, frame_wait_micros);
+            } else {
+              offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas);
+            }
+
+            if (!stream_writer) {
+              now = TimeVal::now();
+              if(now < next_frame_time){
+                long t = next_frame_time - now;
+                if(verbose) fprintf(stderr,"(%s:%d)%s usleep %ld ms\n",__FILE__,__LINE__,__FUNCTION__,t/1000); 
+                usleep(t);
+              }
+            }
           } else {
-            offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas);
+            if(verbose) fprintf(stderr,"skip frame %ld\n", frame_count);
           }
+          frame_count++;
+          next_frame_time += frame_wait_micros;
         }
-        if (!stream_writer) usleep(frame_wait_micros);
       }
 
       // Free the packet that was allocated by av_read_frame
